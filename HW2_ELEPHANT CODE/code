@@ -60,8 +60,8 @@ def drive_folder_to_local(drive_folder_url: str, local_folder: str = "/content/a
 DATABASE_URL = "https://plant-disease-index-default-rtdb.firebaseio.com/"
 
 # 🔗 הקובץ ששלחת
-DRIVE_JSON_ID = "1hikKKqjePaBDbYSYmWqKTFYgspJDHpCA"
-SERVICE_KEY_PATH = "/content/firebase-service-account.json"
+DRIVE_JSON_ID = "null"
+SERVICE_KEY_PATH = "null"
 
 if not os.path.exists(SERVICE_KEY_PATH):
     print("⬇️ Downloading Firebase key from Google Drive...")
@@ -90,7 +90,7 @@ drive.mount("/content/drive", force_remount=True)
 
 
 BASE_URL = "https://server-cloud-v645.onrender.com/"
-GEMINI_API_KEY = "AIzaSyDyJYsZOzA5g1T2JT6zN8wYwcYObC9k_r0"
+GEMINI_API_KEY = "null"
 PDF_DRIVE_LINK = "https://drive.google.com/drive/folders/1_Y3ZzVa19Pa562XMGwaHZhVBsh6l5DxZ"
 PDF_FOLDER = drive_folder_to_local(PDF_DRIVE_LINK, "/content/articles_tmp", clean=True)
 
@@ -880,4 +880,5 @@ with gr.Blocks(
     """)
 
 print("🌐 Launching complete unified Gradio interface...")
+
 demo.launch(share=True, debug=True)
