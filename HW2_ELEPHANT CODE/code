@@ -1,0 +1,883 @@
+
+
+# התקנת ספריות / Installing Libraries
+!pip install -q gradio nltk PyPDF2 transformers torch pillow
+!pip install -q pypdf scikit-learn huggingface_hub sentencepiece datasets
+!pip install -q google-generativeai pandas matplotlib requests
+
+import firebase_admin
+from firebase_admin import credentials, db
+import os
+import re
+import logging
+from collections import defaultdict
+from typing import List, Dict, Tuple
+import traceback
+import shutil
+import requests
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+from PIL import Image
+import gdown
+from nltk.stem import PorterStemmer
+from PyPDF2 import PdfReader
+from pypdf import PdfReader as PdfReader2
+from google.colab import drive
+import google.generativeai as genai
+import gradio as gr
+from transformers import pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from huggingface_hub import hf_hub_download
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ==========================================================
+# drive_folder_to_local (ADDED EARLY so your existing line works)
+# ==========================================================
+def drive_folder_to_local(drive_folder_url: str, local_folder: str = "/content/articles_tmp", clean: bool = True) -> str:
+    """
+    Download a Google Drive folder link into a local folder and return the local path.
+    Requires the Drive folder to be shared as: Anyone with the link (Viewer)
+    """
+    if clean and os.path.exists(local_folder):
+        shutil.rmtree(local_folder)
+    os.makedirs(local_folder, exist_ok=True)
+
+    print("⬇️ Downloading Google Drive folder to local path...")
+    gdown.download_folder(
+        url=drive_folder_url,
+        output=local_folder,
+        quiet=False,
+        use_cookies=False
+    )
+    return local_folder
+# ==========================================================
+# 🔐 Firebase Key (FROM YOUR DRIVE LINK)
+# ==========================================================
+DATABASE_URL = "https://plant-disease-index-default-rtdb.firebaseio.com/"
+
+# 🔗 הקובץ ששלחת
+DRIVE_JSON_ID = "1hikKKqjePaBDbYSYmWqKTFYgspJDHpCA"
+SERVICE_KEY_PATH = "/content/firebase-service-account.json"
+
+if not os.path.exists(SERVICE_KEY_PATH):
+    print("⬇️ Downloading Firebase key from Google Drive...")
+    download_url = f"https://drive.google.com/uc?export=download&id={DRIVE_JSON_ID}"
+    r = requests.get(download_url)
+    with open(SERVICE_KEY_PATH, "wb") as f:
+        f.write(r.content)
+    print("✅ Firebase key downloaded")
+
+if not firebase_admin._apps and os.path.isfile(SERVICE_KEY_PATH):
+    try:
+        cred = credentials.Certificate(SERVICE_KEY_PATH)
+        firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
+        print("🔥 Firebase connected (Index storage only)")
+    except Exception as e:
+        print("⚠️ Firebase init failed:", e)
+else:
+    print("⚠️ Firebase skipped (key missing)")
+
+
+# ==========================================================
+# הגדרות ראשוניות / Initial Configuration
+# ==========================================================
+print("📁 Mounting Google Drive...")
+drive.mount("/content/drive", force_remount=True)
+
+
+BASE_URL = "https://server-cloud-v645.onrender.com/"
+GEMINI_API_KEY = "AIzaSyDyJYsZOzA5g1T2JT6zN8wYwcYObC9k_r0"
+PDF_DRIVE_LINK = "https://drive.google.com/drive/folders/1_Y3ZzVa19Pa562XMGwaHZhVBsh6l5DxZ"
+PDF_FOLDER = drive_folder_to_local(PDF_DRIVE_LINK, "/content/articles_tmp", clean=True)
+
+
+os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
+
+# ==========================================================
+# 🔑 KEY TERMS (AS REQUESTED)
+# ==========================================================
+KEY_TERMS = [
+    "plant",
+    "diseas",
+    "leaf",
+    "infect",
+    "fungal",
+    "virus",
+    "detect",
+    "imag",
+    "symptom",
+    "classifi"
+]
+
+# ==========================================================
+# Academic Search Engine Class (Gemini RAG)
+# ==========================================================
+class AcademicSearchEngine:
+    def __init__(self):
+        self.index = defaultdict(lambda: defaultdict(int))
+        self.documents = {}
+        self.doc_names = {}
+        self.stemmer = PorterStemmer()
+        self.stop_words = {
+            'a','an','the','and','or','in','on','at','to','for','of',
+            'with','is','are','was','were','by','as','from'
+        }
+
+    def read_pdf(self, path):
+        try:
+            reader = PdfReader(path)
+            return "\n".join(p.extract_text() or "" for p in reader.pages)
+        except:
+            return ""
+
+    def load_documents(self, folder):
+        doc_id = 0
+        for f in os.listdir(folder):
+            if f.lower().endswith(".pdf"):
+                content = self.read_pdf(os.path.join(folder, f))
+                if content.strip():
+                    self.documents[doc_id] = content
+                    self.doc_names[doc_id] = f
+                    doc_id += 1
+        print(f"✅ Loaded {len(self.documents)} PDFs")
+
+    def process_text(self, text):
+        words = re.findall(r"\w+", text.lower())
+        stems = [
+            self.stemmer.stem(w)
+            for w in words
+            if w not in self.stop_words and len(w) > 2
+        ]
+        # 🔑 שימוש ב-KEY_TERMS
+        return [w for w in stems if any(k in w for k in KEY_TERMS)]
+
+    def build_index(self):
+        for doc_id, text in self.documents.items():
+            for term in self.process_text(text):
+                self.index[term][doc_id] += 1
+        print(f"🔨 Index built with {len(self.index)} key terms")
+
+    def retrieve_documents(self, query, top_k=3):
+        scores = defaultdict(int)
+        for term in self.process_text(query):
+            for doc_id, cnt in self.index.get(term, {}).items():
+                scores[doc_id] += cnt
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        return [(d, s, self.doc_names[d]) for d, s in ranked]
+
+
+
+#==========================================================
+
+
+
+
+# ==========================================================
+# Gemini RAG System Class
+# ==========================================================
+class GeminiRAG:
+    """RAG system with Gemini"""
+
+    def __init__(self, engine: AcademicSearchEngine, api_key: str):
+        print("🔧 Configuring Gemini...")
+        genai.configure(api_key=api_key)
+        self.engine = engine
+
+        available_models = [m.name for m in genai.list_models()]
+        print(f"📋 Available models: {available_models[:5]}")
+
+        model_name = "gemini-2.5-flash"
+        print(f"🎯 Using model: {model_name}")
+
+        self.model = genai.GenerativeModel(
+            model_name=model_name,
+            generation_config={
+                "temperature": 0.3,
+                "top_p": 0.8,
+                "max_output_tokens": 2048,
+            }
+        )
+        print("✅ Gemini configured successfully\n")
+
+    def create_context(self, ranked_docs: List[Tuple[int, int, str]],
+                       max_chars_per_doc: int = 1500) -> str:
+        """Create context from documents"""
+        context_parts = []
+
+        for doc_id, score, filename in ranked_docs:
+            content = self.engine.documents[doc_id]
+            snippet = content[:max_chars_per_doc]
+            if len(content) > max_chars_per_doc:
+                snippet += "..."
+
+            context_parts.append(
+                f"=== DOCUMENT: {filename} (ID: {doc_id}, Relevance Score: {score}) ===\n"
+                f"{snippet}\n"
+            )
+
+        return "\n\n".join(context_parts)
+
+    def query(self, question: str, top_k: int = 2, max_chars_per_doc: int = 1500) -> Dict[str, str]:
+        """Query the RAG system"""
+
+        print("\n" + "="*60)
+        print("🚀 STARTING RAG QUERY")
+        print("="*60)
+
+        try:
+            ranked_docs = self.engine.retrieve_documents(question, top_k)
+
+            if not ranked_docs:
+                return {
+                    "answer": "❌ No relevant documents found.\n\n**Tips:**\n- Try different keywords\n- Use technical terms related to your topic\n- Check if documents loaded correctly",
+                    "sources": "None"
+                }
+
+            print("\n📝 Creating context...")
+            context = self.create_context(ranked_docs, max_chars_per_doc)
+            print(f"✅ Context created: {len(context)} chars")
+
+            print("\n🎯 Building prompt...")
+            prompt = f"""You are an academic research assistant specializing in plant diseases and image classification.
+
+TASK: Answer the question using ONLY the information from the provided documents.
+
+RULES:
+1. Base your answer EXCLUSIVELY on the provided documents
+2. If the information is not in the documents, clearly state that
+3. Cite your sources (mention document name or ID)
+4. Structure your answer with clear points
+5. Be concise but comprehensive
+
+QUESTION:
+{question}
+
+DOCUMENTS:
+
+{context}
+
+ANSWER:"""
+
+            print(f"✅ Prompt ready: {len(prompt)} chars")
+
+            print("\n🤖 Calling Gemini API...")
+            response = self.model.generate_content(prompt)
+
+            print("✅ Gemini responded successfully!")
+            print(f"📊 Response length: {len(response.text)} chars")
+
+            answer = response.text
+
+            sources = "\n".join([
+                f"📄 {filename} (Score: {score})"
+                for _, score, filename in ranked_docs
+            ])
+
+            print("\n" + "="*60)
+            print("✅ RAG QUERY COMPLETED SUCCESSFULLY")
+            print("="*60 + "\n")
+
+            return {
+                "answer": answer,
+                "sources": sources
+            }
+
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            print("\n" + "="*60)
+            print("❌ ERROR IN RAG QUERY")
+            print("="*60)
+            print(error_trace)
+            print("="*60 + "\n")
+
+            error_msg = f"""❌ **Error Processing Query**
+
+**Error Type:** {type(e).__name__}
+**Message:** {str(e)}
+"""
+
+            return {
+                "answer": error_msg,
+                "sources": "Error occurred"
+            }
+
+# ==========================================================
+# TF-IDF Retriever for Image Diagnosis
+# ==========================================================
+class TfidfRetriever:
+    def __init__(self, docs: list):
+        self.docs = docs
+        self.vectorizer = TfidfVectorizer(stop_words="english")
+        self.X = self.vectorizer.fit_transform(docs)
+
+    def search(self, query: str, top_k=3):
+        q = self.vectorizer.transform([query])
+        sims = cosine_similarity(q, self.X).flatten()
+        idxs = sims.argsort()[::-1][:top_k]
+        return [self.docs[i] for i in idxs]
+
+# ==========================================================
+# PDF Processing for Image Diagnosis
+# ==========================================================
+def pdf_to_text(pdf_path: str) -> str:
+    reader = PdfReader2(pdf_path)
+    parts = []
+    for page in reader.pages:
+        t = page.extract_text()
+        if t:
+            parts.append(t)
+    return "\n".join(parts)
+
+def chunk_text(text: str, chunk_size=1200, overlap=200):
+    text = " ".join(text.split())
+    chunks = []
+    i = 0
+    while i < len(text):
+        chunks.append(text[i:i+chunk_size])
+        i += (chunk_size - overlap)
+    return chunks
+
+def build_pdf_retriever_from_drive(pdf_folder: str):
+    pdf_paths = []
+    for name in os.listdir(pdf_folder):
+        if name.lower().endswith(".pdf"):
+            pdf_paths.append(os.path.join(pdf_folder, name))
+
+    if not pdf_paths:
+        return None, f"⚠ No PDFs found in folder: {pdf_folder}"
+
+    all_chunks = []
+    for p in pdf_paths:
+        try:
+            txt = pdf_to_text(p)
+            if txt.strip():
+                all_chunks.extend(chunk_text(txt))
+        except Exception as e:
+            print("PDF read error:", p, e)
+
+    if not all_chunks:
+        return None, "⚠ Failed to extract text from PDFs."
+
+    retriever = TfidfRetriever(all_chunks)
+    return retriever, f"✅ Built PDF index from {len(pdf_paths)} files ({len(all_chunks)} chunks)."
+
+def load_model_card_chunks(model_id: str):
+    try:
+        path = hf_hub_download(repo_id=model_id, filename="README.md")
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        return chunk_text(text, chunk_size=1200, overlap=150)
+    except Exception:
+        return []
+
+# ==========================================================
+# IoT Functions
+# ==========================================================
+def get_sensor_data(feed, limit):
+    """Get sensor data from central server"""
+    try:
+        response = requests.get(
+            f"{BASE_URL}/history",
+            params={"feed": feed, "limit": limit}
+        )
+        data = response.json()
+
+        if "data" not in data:
+            return "❌ Error fetching data"
+
+        values = [str(sample["value"]) for sample in data["data"]]
+
+        output_text = f"Feed: {feed}\nSamples: {len(values)}\n\n"
+        output_text += "\n".join(values)
+
+        return output_text
+
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+def plot_all_feeds(limit):
+    """Plot all sensor feeds"""
+    feeds = ["temperature", "humidity", "soil"]
+    figures = []
+
+    for feed in feeds:
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/history",
+                params={"feed": feed, "limit": limit}
+            )
+            data = resp.json()
+
+            if "data" not in data:
+                figures.append(None)
+                continue
+
+            df = pd.DataFrame(data["data"])
+            df["created_at"] = pd.to_datetime(df["created_at"])
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+
+            fig, ax = plt.subplots(figsize=(6, 3))
+            ax.plot(df["created_at"], df["value"], marker="o", color="#4CAF50", linewidth=2)
+            ax.set_title(feed.capitalize(), fontsize=14, fontweight="bold")
+            ax.set_xlabel("Time", fontsize=11)
+            ax.set_ylabel("Value", fontsize=11)
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+
+            figures.append(fig)
+        except Exception as e:
+            print(f"Error plotting {feed}: {e}")
+            figures.append(None)
+
+    return figures
+
+# ==========================================================
+# Initialize Systems
+# ==========================================================
+print("\n" + "="*60)
+print("🚀 INITIALIZING ALL SYSTEMS")
+print("="*60 + "\n")
+
+# 1) Gemini RAG System
+print("1️⃣ Initializing Gemini RAG System...")
+engine = AcademicSearchEngine()
+engine.load_documents(PDF_FOLDER)
+engine.build_index()
+rag_system = GeminiRAG(engine, GEMINI_API_KEY)
+
+# 2) Image Classification Models
+print("\n2️⃣ Loading Image Classification Models...")
+IMAGE_MODEL_ID = "linkanjarad/mobilenet_v2_1.0_224-plant-disease-identification"
+TEXT_MODEL_ID = "google/flan-t5-small"
+
+device = 0 if torch.cuda.is_available() else -1
+
+print("Loading image model...")
+clf = pipeline("image-classification", model=IMAGE_MODEL_ID, device=device)
+
+print("Loading text model (for explanations)...")
+llm = pipeline("text2text-generation", model=TEXT_MODEL_ID, device=device)
+
+# 3) Build PDF Retriever for Image Diagnosis
+print("\n3️⃣ Building PDF Retriever for Image Diagnosis...")
+pdf_retriever, pdf_status = build_pdf_retriever_from_drive(PDF_FOLDER)
+print(pdf_status)
+
+# 4) Load HuggingFace Model Card
+print("\n4️⃣ Loading HuggingFace Model Documentation...")
+hf_chunks = load_model_card_chunks(IMAGE_MODEL_ID)
+hf_retriever = TfidfRetriever(hf_chunks) if len(hf_chunks) > 0 else None
+
+print("\n" + "="*60)
+print("✅ ALL SYSTEMS READY")
+print("="*60 + "\n")
+
+# ==========================================================
+# Image Diagnosis Functions
+# ==========================================================
+def parse_label(label: str):
+    if "___" in label:
+        plant, disease_raw = label.split("___", 1)
+    else:
+        plant, disease_raw = "Plant", label
+    disease_clean = disease_raw.replace("_", " ").strip()
+    return plant, disease_raw, disease_clean
+
+def make_query(plant: str, disease_clean: str):
+    return f"{plant} {disease_clean} symptoms causes treatment prevention"
+
+def rag_explain(plant: str, disease_raw: str, disease_clean: str) -> str:
+    if "healthy" in disease_raw.lower():
+        return (
+            "✅ The plant appears **healthy**.\n\n"
+            f"🌿 Identified plant: **{plant}**\n"
+            "No significant disease symptoms were detected in the image."
+        )
+
+    query = make_query(plant, disease_clean)
+
+    pdf_context = ""
+    hf_context = ""
+
+    if pdf_retriever is not None:
+        pdf_hits = pdf_retriever.search(query, top_k=2)
+        pdf_context = "\n\n".join([h[:700] for h in pdf_hits])
+
+    if hf_retriever is not None:
+        hf_hits = hf_retriever.search(query, top_k=1)
+        hf_context = "\n\n".join([h[:700] for h in hf_hits])
+
+    if not pdf_context and not hf_context:
+        return (
+            f"⚠ The plant is likely **diseased**.\n\n"
+            f"🌿 Plant: **{plant}**\n"
+            f"🩺 Disease: **{disease_clean}**\n\n"
+            "No textual knowledge source was available (PDFs or HF info missing)."
+        )
+
+    sources = ""
+    if pdf_context:
+        sources += f"PDF SOURCES:\n{pdf_context}\n\n"
+    if hf_context:
+        sources += f"HUGGING FACE SOURCES:\n{hf_context}\n\n"
+
+    prompt = (
+        "You are a helpful agricultural assistant.\n"
+        "Using ONLY the sources below, write a short explanation in English.\n"
+        "Include: (1) what the disease is, (2) common symptoms, "
+        "(3) general prevention or treatment advice.\n"
+        "Be concise. Do NOT mention confidence percentages.\n\n"
+        f"Plant: {plant}\n"
+        f"Disease: {disease_clean}\n\n"
+        f"SOURCES:\n{sources}\n"
+        "English answer:"
+    )
+
+    out = llm(prompt, max_new_tokens=220)[0]["generated_text"].strip()
+
+    return (
+        f"⚠ The plant is likely **diseased**\n\n"
+        f"🌿 Plant: **{plant}**\n"
+        f"🩺 Disease: **{disease_clean}**\n\n"
+        f"{out}"
+    )
+
+# ==========================================================
+# NEW FEATURE (ADDED): Treatment Recommendation from Gemini AI (NOT from PDFs)
+# ==========================================================
+def gemini_treatment_recommendation(plant: str, disease_clean: str) -> str:
+    """
+    Treatment recommendation comes ONLY from Gemini AI.
+    NOT using PDFs / HF sources.
+    """
+    try:
+        prompt = f"""
+You are an expert agricultural assistant.
+
+Task:
+Give practical treatment recommendations for the plant disease.
+
+Plant: {plant}
+Disease: {disease_clean}
+
+Rules:
+- Return 5-7 bullet points
+- Include: immediate actions, prevention, and monitoring
+- Keep it simple and actionable
+- Do NOT mention confidence percentages
+- Do NOT mention PDFs/documents/sources
+"""
+        resp = rag_system.model.generate_content(prompt)
+        return resp.text.strip()
+    except Exception as e:
+        return f"⚠️ Gemini treatment error: {e}"
+
+def diagnose(image: Image.Image):
+    """Main diagnosis function"""
+    pred = clf(image)
+    top_label = pred[0]["label"]
+
+    plant, disease_raw, disease_clean = parse_label(top_label)
+    explanation = rag_explain(plant, disease_raw, disease_clean)
+
+    return explanation
+
+# ==========================================================
+# NEW FEATURE (ADDED): Diagnose wrapper that appends Gemini Treatment
+# (No deletion of your diagnose; we just override name AFTER it)
+# ==========================================================
+def diagnose_with_treatment(image: Image.Image):
+    pred = clf(image)
+    top_label = pred[0]["label"]
+
+    plant, disease_raw, disease_clean = parse_label(top_label)
+    explanation = rag_explain(plant, disease_raw, disease_clean)
+
+    if "healthy" in disease_raw.lower():
+        treatment = "✅ No treatment needed. Keep regular monitoring and proper care."
+    else:
+        treatment = gemini_treatment_recommendation(plant, disease_clean)
+
+    return (
+        f"{explanation}\n\n"
+        "-----------------------------\n"
+        "✅ **Treatment Recommendation (Gemini AI)**\n"
+        f"{treatment}"
+    )
+
+# Override the function used by Gradio click (ADDED)
+diagnose = diagnose_with_treatment
+
+# ==========================================================
+# Gradio Handler Functions
+# ==========================================================
+def gradio_query_handler(user_query: str, top_k: int) -> Tuple[str, str]:
+    """Handle RAG query"""
+    if not user_query or not user_query.strip():
+        return "⚠️ Please enter a question", ""
+
+    print(f"\n{'='*60}")
+    print(f"USER QUERY: {user_query}")
+    print(f"TOP-K: {top_k}")
+    print(f"{'='*60}")
+
+    result = rag_system.query(
+        question=user_query.strip(),
+        top_k=int(top_k),
+        max_chars_per_doc=1500
+    )
+
+    return result["answer"], result["sources"]
+
+# ==========================================================
+# Unified Gradio Interface - 4 TABS!
+# ==========================================================
+with gr.Blocks(
+    title="🌱 Plant Disease Research & Monitoring System",
+    theme=gr.themes.Soft(
+        primary_hue="green",
+        secondary_hue="emerald",
+        neutral_hue="slate",
+    ),
+    css="""
+        .gradio-container {
+            max-width: 1400px !important;
+        }
+        .tab-nav button {
+            font-size: 16px !important;
+            font-weight: 600 !important;
+            padding: 12px 24px !important;
+        }
+        .main-header {
+            text-align: center;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+        .section-header {
+            background: linear-gradient(90deg, #11998e 0%, #38ef7d 100%);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 15px 0;
+            font-weight: bold;
+        }
+    """
+) as demo:
+
+    # Main Header
+    gr.HTML("""
+        <div class="main-header">
+            <h1 style="margin: 0; font-size: 32px;">🌱 Plant Disease Research & Monitoring System</h1>
+            <p style="margin: 10px 0 0 0; font-size: 16px; opacity: 0.9;">
+                Complete AI-Powered Platform: RAG + IoT + Image Diagnosis
+            </p>
+        </div>
+    """)
+
+    # Tabs
+    with gr.Tabs() as tabs:
+
+        # ============================================
+        # Tab 1: Plant Disease Image Diagnosis (NEW!)
+        # ============================================
+        with gr.Tab("🔬 Disease Diagnosis", id=0):
+            gr.HTML('<div class="section-header">🔬 AI-Powered Plant Disease Detection</div>')
+
+            gr.Markdown("""
+            Upload an image of a plant leaf to receive:
+            - **Disease identification** using deep learning
+            - **Detailed explanation** from academic sources
+            - **Treatment recommendations** based on research papers
+
+            *System uses MobileNet V2 + RAG with academic PDFs*
+            """)
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    image_input = gr.Image(
+                        type="pil",
+                        label="📷 Upload Plant Leaf Image",
+                        height=400
+                    )
+                    diagnose_btn = gr.Button(
+                        "🔍 Analyze Disease",
+                        variant="primary",
+                        size="lg"
+                    )
+
+                with gr.Column(scale=1):
+                    diagnosis_output = gr.Textbox(
+                        label="📋 Diagnosis Report",
+                        lines=20,
+                        interactive=False
+                    )
+
+            diagnose_btn.click(
+                fn=diagnose,
+                inputs=image_input,
+                outputs=diagnosis_output
+            )
+
+            gr.Markdown("""
+            ---
+            **How it works:**
+            1. Upload a clear image of the plant leaf
+            2. AI model identifies the plant and disease
+            3. System searches academic papers for relevant information
+            4. Generates comprehensive diagnosis with treatment options
+            """)
+
+        # ============================================
+        # Tab 2: Academic RAG System
+        # ============================================
+        with gr.Tab("📚 Research Assistant", id=1):
+            gr.HTML('<div class="section-header">🔍 Ask Questions About Plant Diseases</div>')
+
+            gr.Markdown("""
+            Search through academic papers and get AI-powered answers about:
+            - Plant disease detection methods
+            - Image classification techniques
+            - Deep learning architectures
+            - Research datasets and methodologies
+            """)
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    query_input = gr.Textbox(
+                        label="🔍 Enter Your Research Question",
+                        placeholder="Example: What are the methods for detecting plant leaf diseases?",
+                        lines=3
+                    )
+
+                with gr.Column(scale=1):
+                    topk_slider = gr.Slider(
+                        minimum=1,
+                        maximum=5,
+                        value=2,
+                        step=1,
+                        label="📄 Number of Documents"
+                    )
+
+            submit_btn = gr.Button("🚀 Search & Generate Answer", variant="primary", size="lg")
+
+            gr.Markdown("---")
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### ✅ AI-Generated Answer")
+                    answer_output = gr.Markdown(value="*Your answer will appear here...*")
+
+                    gr.Markdown("### 📚 Sources Referenced")
+                    sources_output = gr.Textbox(
+                        label="Documents used for this answer",
+                        lines=4,
+                        interactive=False
+                    )
+
+            # Connect RAG button
+            submit_btn.click(
+                fn=gradio_query_handler,
+                inputs=[query_input, topk_slider],
+                outputs=[answer_output, sources_output]
+            )
+
+            # Examples
+            gr.Examples(
+                examples=[
+                    ["What are methods for detecting plant leaf diseases?", 2],
+                    ["How does deep learning work for image classification?", 3],
+                    ["What are the challenges in plant disease recognition?", 2],
+                    ["Which CNN architectures are used for plant disease detection?", 3],
+                    ["What datasets are available for plant disease research?", 2],
+                ],
+                inputs=[query_input, topk_slider],
+                label="💡 Example Questions"
+            )
+
+        # ============================================
+        # Tab 3: IoT Sensor Data Viewer
+        # ============================================
+        with gr.Tab("📊 Sensor Data", id=2):
+            gr.HTML('<div class="section-header">📡 Real-time Sensor Data</div>')
+
+            gr.Markdown("View raw sensor readings from your IoT devices")
+
+            with gr.Row():
+                feed_input = gr.Dropdown(
+                    choices=["humidity", "soil", "temperature", "json"],
+                    value="humidity",
+                    label="🌡️ Select Sensor Feed"
+                )
+
+                limit_input = gr.Slider(
+                    minimum=1,
+                    maximum=100,
+                    value=10,
+                    step=1,
+                    label="📊 Number of Samples"
+                )
+
+            fetch_button = gr.Button("📥 Fetch Sensor Data", variant="primary", size="lg")
+
+            output_box = gr.Textbox(
+                label="📋 Sensor Values",
+                lines=15,
+                interactive=False
+            )
+
+            fetch_button.click(
+                fn=get_sensor_data,
+                inputs=[feed_input, limit_input],
+                outputs=output_box
+            )
+
+        # ============================================
+        # Tab 4: IoT Dashboard with Charts
+        # ============================================
+        with gr.Tab("📈 Visual Dashboard", id=3):
+            gr.HTML('<div class="section-header">📈 Plant Monitoring Dashboard</div>')
+
+            gr.Markdown("Visual analysis of environmental conditions")
+
+            limit_slider = gr.Slider(
+                minimum=5,
+                maximum=50,
+                value=20,
+                step=1,
+                label="📊 Data Points to Display"
+            )
+
+            btn = gr.Button("🔄 Refresh Dashboard", variant="primary", size="lg")
+
+            with gr.Row():
+                temp_plot = gr.Plot(label="🌡️ Temperature")
+                hum_plot = gr.Plot(label="💧 Humidity")
+                soil_plot = gr.Plot(label="🌱 Soil Moisture")
+
+            btn.click(
+                fn=plot_all_feeds,
+                inputs=limit_slider,
+                outputs=[temp_plot, hum_plot, soil_plot]
+            )
+
+    # Footer
+    gr.Markdown("""
+    ---
+    **System Status:**
+    - ✅ RAG System (Gemini 2.5): Active
+    - ✅ Image Classification (MobileNet V2): Active
+    - ✅ IoT Server: Connected
+    - ✅ PDF Knowledge Base: Loaded
+
+    *Complete integrated system developed with Shneiderman's Design Principles*
+    """)
+
+print("🌐 Launching complete unified Gradio interface...")
+demo.launch(share=True, debug=True)
